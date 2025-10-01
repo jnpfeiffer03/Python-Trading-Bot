@@ -1,0 +1,20 @@
+{
+    "pair": "QNTUSDT",
+    "timeframe": "5m",
+    "starting_date": "1 January 2024",
+    "ending_date": "30 December 2024",
+    "initial_bank": 1000,
+    "martingale": false,
+    "fee_rate": 0.0001,
+    "rsi_periods": 14,
+    "rsi_ema": true,
+    "first_tp_perc": 1,
+    "sec_tp_perc": 1.5,
+    "sl_perc": -1,
+    "rsi_value_1": 42.5,
+    "rsi_value_2": 55,
+    "buy_rsi_1": 29.5,
+    "buy_rsi_2": 28.5,
+    "buy_rsi_3": 27
+}
+
