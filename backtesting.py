@@ -1,200 +1,264 @@
+# File: backtesting.py
+
+import os
+import json
 import pandas as pd
-import numpy as np
 from binance.client import Client
 
-def download_data(name_base, name_quote, timeframe, starting_date, ending_date):
-    info = Client().get_historical_klines(name_base + name_quote, timeframe, starting_date, ending_date)
-    data = pd.DataFrame(info, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_av', 'trades', 'tb_base_av', 'tb_quote_av', 'ignore'])
-    data.drop(columns=data.columns.difference(['timestamp', 'close']), inplace=True)
+CONFIG_PATH = "config.json"
+LOGS_DIR = "logs"
+CSV_PATH = os.path.join(LOGS_DIR, "backtesting.csv")
+
+def load_config():
+    # Load settings from config.json, else use defaults.
+    defaults = {
+        "pair": "QNTUSDT",
+        "timeframe": "5m",
+        "starting_date": "1 January 2024",
+        "ending_date": "30 December 2024",
+        "initial_bank": 1000,
+        "fee_rate": 0.0001,
+        "rsi_periods": 14,
+        "rsi_ema": True,
+        "first_tp_perc": 1,
+        "sec_tp_perc": 1.5,
+        "sl_perc": -1,
+        "rsi_value_1": 42.5,
+        "rsi_value_2": 55,
+        "buy_rsi_1": 29.5,
+        "buy_rsi_2": 28.5,
+        "buy_rsi_3": 27
+    }
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "r") as f:
+            user = json.load(f)
+        for k in defaults:
+            if k not in user:
+                user[k] = defaults[k]
+        return user
+    else:
+        print("config.json not found, using defaults!")
+        return defaults
+
+def download_data(pair, timeframe, starting_date, ending_date):
+    client = Client()
+    klines = client.get_historical_klines(pair, timeframe, starting_date, ending_date)
+    data = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_av', 'trades', 'tb_base_av', 'tb_quote_av', 'ignore'])
+    data = data[['timestamp', 'close']]
     data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
     data['close'] = pd.to_numeric(data['close'])
     return data
 
-def calculate_rsi(data, window=14):
-    delta = data.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-
-    rs = gain / loss
+def calculate_rsi(series, periods=14, ema=True):
+    if len(series) < periods:
+        return pd.Series([float('nan')] * len(series), index=series.index)
+    delta = series.diff(1)
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    if ema:
+        avg_gain = gain.ewm(com=periods-1, min_periods=periods, adjust=False).mean()
+        avg_loss = loss.ewm(com=periods-1, min_periods=periods, adjust=False).mean()
+    else:
+        avg_gain = gain.rolling(window=periods, min_periods=periods).mean()
+        avg_loss = loss.rolling(window=periods, min_periods=periods).mean()
+    rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
-
     return rsi
 
-def backtest_strategy(data):
-    initial_bank = 1000 #The inital bank that the user will use
-    bank = initial_bank
-    holdings = 0
-    buy_price = 0
-    max_drawdown = 0
-    wins = 0
-    losses = 0
-    first_tp_perc = 1 #Values for TPs
-    sec_tp_perc = 1.5
-    sl_perc = -2 #Value for SL
-    rsi_value_1 = 42.5 #Values for TPs in the RSI
-    rsi_value_2 = 55
-    buy_rsi_1 = 29.5 #Values for buys in the RSI
-    buy_rsi_2 = 28.5
-    buy_rsi_3 = 27
-   # Flags to track if a buy level and TP1 has been triggered 
-    bought_buy_1 = False
-    bought_buy_2 = False
-    bought_buy_3 = False
-    tp_1_hit = False
-
-    for index, row in data.iterrows():
+def backtest_strategy(data, cfg):
+    # === STATE ===
+    state = {
+        "bank": cfg["initial_bank"],
+        "holdings": 0,
+        "buy_price": 0,
+        "bought_buy_1": False,
+        "bought_buy_2": False,
+        "bought_buy_3": False,
+        "tp_1_hit": False,
+        "last_realized_loss": 0,
+        "wins": 0,
+        "losses": 0,
+        "max_drawdown": 0,
+        "last_peak": cfg["initial_bank"]
+    }
+    fee_rate = cfg.get("fee_rate", 0.001)
+    log_rows = []
+    for i, row in data.iterrows():
         rsi = row['RSI']
         price = row['close']
-        buy_amount = 0
+        ts = row['timestamp']
+        action = None
+        trade_size = 0
         profit_percent = 0
-        
-        # Check for buy signals
-        if holdings == 0 or (holdings > 0 and tp_1_hit):
-            if rsi < buy_rsi_1 and not bought_buy_1:
-                buy_amount = bank * (0.25 if tp_1_hit else 0.4) # If TP1 was hit, we lower the bank amount invested if RSI goes below buy_rsi_1 again
-                bought_buy_1 = True
-                bank -= buy_amount
-                holdings += buy_amount / price
-                buy_price = price if holdings == buy_amount / price else buy_price
-            elif rsi < buy_rsi_2 and not bought_buy_2:
-                buy_amount = bank * 0.5
-                bought_buy_2 = True
-                bank -= buy_amount
-                holdings += buy_amount / price
-                buy_price = price if holdings == buy_amount / price else buy_price
-            elif rsi < buy_rsi_3 and not bought_buy_3:
-                buy_amount = bank
-                bought_buy_3 = True
-                bank -= buy_amount
-                holdings += buy_amount / price
-                buy_price = price if holdings == buy_amount / price else buy_price
+        fee_paid = 0
+        used_loss = 0
 
-            # Update bank and holdings if a buy signal was triggered
-            if buy_amount > 0:
-                bank -= buy_amount
-                holdings += buy_amount / price
-                buy_price = price if holdings == buy_amount / price else buy_price
+        # BUY LOGIC (with loss recovery)
+        if state['holdings'] == 0 or (state['holdings'] > 0 and state['tp_1_hit']):
+            martingale = cfg.get("martingale", True)
+            last_loss = abs(state.get('last_realized_loss', 0)) if martingale else 0
+            used_loss = last_loss
+            buy_amount = 0
+            if rsi < cfg["buy_rsi_1"] and not state['bought_buy_1']:
+                base_amount = state['bank'] * (0.25 if state['tp_1_hit'] else 0.4)
+                buy_amount = min(base_amount + last_loss, state['bank'])
+                size = (buy_amount * (1 - fee_rate)) / price
+                state['bank'] -= buy_amount
+                state['holdings'] += size
+                state['buy_price'] = price
+                state['bought_buy_1'] = True
+                fee_paid = buy_amount * fee_rate
+                action = "BUY1"
+                trade_size = size
+                state['last_realized_loss'] = 0
+            elif rsi < cfg["buy_rsi_2"] and not state['bought_buy_2']:
+                base_amount = state['bank'] * 0.5
+                buy_amount = min(base_amount + last_loss, state['bank'])
+                size = (buy_amount * (1 - fee_rate)) / price
+                state['bank'] -= buy_amount
+                state['holdings'] += size
+                state['buy_price'] = price
+                state['bought_buy_2'] = True
+                fee_paid = buy_amount * fee_rate
+                action = "BUY2"
+                trade_size = size
+                state['last_realized_loss'] = 0
+            elif rsi < cfg["buy_rsi_3"] and not state['bought_buy_3']:
+                base_amount = state['bank']
+                buy_amount = min(base_amount + last_loss, state['bank'])
+                size = (buy_amount * (1 - fee_rate)) / price
+                state['bank'] -= buy_amount
+                state['holdings'] += size
+                state['buy_price'] = price
+                state['bought_buy_3'] = True
+                fee_paid = buy_amount * fee_rate
+                action = "BUY3"
+                trade_size = size
+                state['last_realized_loss'] = 0
 
-        # Check for sell signals
-        if holdings > 0:
-            profit_percent = (price - buy_price) / buy_price * 100
-            # First sell condition(TP1)
-            if profit_percent >= first_tp_perc or rsi > rsi_value_1:
-                sell_amount = holdings * 0.8
-                bank += sell_amount * price
-                holdings -= sell_amount
-                bought_buy_1 = False
-                bought_buy_2 = False
-                bought_buy_3 = False
-                tp_1_hit = True
-                if profit_loss_percent > 0: 
-                    wins += 1
-                else: 
-                    losses += 1
+        # SELL LOGIC
+        if state['holdings'] > 0:
+            profit_percent = (price - state['buy_price']) / state['buy_price'] * 100
+            gross_value = state['holdings'] * price
+            fee = gross_value * fee_rate
+            net_value = gross_value - fee
+            # TP1 (partial sell)
+            if profit_percent >= cfg["first_tp_perc"] or rsi > cfg["rsi_value_1"]:
+                sell_amount = state['holdings'] * 0.8
+                gross_sell = sell_amount * price
+                fee_sell = gross_sell * fee_rate
+                net_sell = gross_sell - fee_sell
+                state['holdings'] -= sell_amount
+                state['bank'] += net_sell
+                state['tp_1_hit'] = True
+                state['bought_buy_1'] = False
+                state['bought_buy_2'] = False
+                state['bought_buy_3'] = False
+                fee_paid = fee_sell
+                action = "TP1"
+                trade_size = sell_amount
+            # TP2 (full sell)
+            if profit_percent >= cfg["sec_tp_perc"] or rsi > cfg["rsi_value_2"]:
+                sell_amount = state['holdings']
+                gross_sell = sell_amount * price
+                fee_sell = gross_sell * fee_rate
+                net_sell = gross_sell - fee_sell
+                state['bank'] += net_sell
+                state['holdings'] = 0
+                state['tp_1_hit'] = False
+                state['bought_buy_1'] = False
+                state['bought_buy_2'] = False
+                state['bought_buy_3'] = False
+                fee_paid = fee_sell
+                action = "TP2"
+                trade_size = sell_amount
+                # Win/loss and loss carry
+                if profit_percent > 0:
+                    state['wins'] += 1
+                    state['last_realized_loss'] = 0  # reset loss after win
+                else:
+                    # Loss at TP2, add to loss carry
+                    realized_loss = max(state['buy_price'] * sell_amount - net_sell, 0)
+                    state['losses'] += 1
+                    state['last_realized_loss'] = realized_loss
+            # STOP LOSS
+            loss_percent = (price - state['buy_price']) / state['buy_price'] * 100
+            if loss_percent <= cfg["sl_perc"]:
+                sell_amount = state['holdings']
+                gross_sell = sell_amount * price
+                fee_sell = gross_sell * fee_rate
+                net_sell = gross_sell - fee_sell
+                realized_loss = max(state['buy_price'] * sell_amount - net_sell, 0)
+                state['bank'] += net_sell
+                state['holdings'] = 0
+                state['tp_1_hit'] = False
+                state['bought_buy_1'] = False
+                state['bought_buy_2'] = False
+                state['bought_buy_3'] = False
+                fee_paid = fee_sell
+                action = "STOPLOSS"
+                trade_size = sell_amount
+                state['losses'] += 1
+                state['last_realized_loss'] = realized_loss
 
-            # Second sell condition(TP2)
-            if profit_percent >= sec_tp_perc or rsi > rsi_value_2:
-                sell_amount = holdings
-                bank += sell_amount * price
-                holdings = 0
-                bought_buy_1 = False
-                bought_buy_2 = False
-                bought_buy_3 = False
-                if profit_loss_percent > 0: 
-                    wins += 1
-                else: 
-                    losses += 1
-                        
-            if tp_1_hit and (rsi > rsi_value_2):
-                bought_buy_1 = False
-                bought_buy_2 = False
-                bought_buy_3 = False
-                tp_1_hit = False
-                
-        # Check for stop loss conditions only if we have holdings
-        if holdings > 0:
-            loss_percent = (price - buy_price) / buy_price * 100
-            if loss_percent <= sl_perc:
-                sell_amount = holdings
-                bank += sell_amount * price
-                holdings = 0
-                bought_buy_1 = False
-                bought_buy_2 = False
-                bought_buy_3 = False
-                tp_1_hit = False  
-                losses += 1  # Increment losses when we hit stop loss
+        # Drawdown tracking
+        total_value = state['bank'] + state['holdings'] * price
+        if total_value > state['last_peak']:
+            state['last_peak'] = total_value
+        dd = (total_value - state['last_peak']) / state['last_peak'] * 100
+        if dd < state['max_drawdown']:
+            state['max_drawdown'] = dd
 
-        # Update wins and losses based on sell conditions and actual PnL
-        profit_loss_percent = (price - buy_price) / buy_price * 100 if buy_price != 0 else 0
-        
-        if (profit_percent >= first_tp_perc or rsi > rsi_value_1) and profit_loss_percent > 0:
-            wins += 1
-        elif (profit_percent >= first_tp_perc or rsi > rsi_value_1) and profit_loss_percent <= 0:
-            losses += 1
+        # Log the trade
+        if action is not None:
+            log_rows.append({
+                "timestamp": ts,
+                "action": action,
+                "price": price,
+                "RSI": rsi,
+                "size": trade_size,
+                "bank": state['bank'],
+                "holdings": state['holdings'],
+                "buy_price": state['buy_price'],
+                "profit_percent": profit_percent,
+                "fee_paid": fee_paid,
+                "used_loss": used_loss,
+                "last_realized_loss": state.get('last_realized_loss', 0)
+            })
 
-        if (profit_percent >= sec_tp_perc or rsi > rsi_value_2) and profit_loss_percent > 0:
-            wins += 1
-        elif (profit_percent >= sec_tp_perc or rsi > rsi_value_2) and profit_loss_percent <= 0:
-            losses += 1
+    # Final PnL stats
+    final_value = state['bank'] + state['holdings'] * data.iloc[-1]['close']
+    profit_loss = final_value - cfg["initial_bank"]
+    roi = profit_loss / cfg["initial_bank"]
+    winrate = state['wins'] / (state['wins'] + state['losses']) if (state['wins'] + state['losses']) > 0 else 0
 
-            
-        # Calculate drawdown
-        current_drawdown = (price - buy_price) / buy_price * 100 if buy_price != 0 else 0
-        max_drawdown = min(max_drawdown, current_drawdown)
+    summary = {
+        "profit_loss": profit_loss,
+        "roi": roi,
+        "winrate": winrate,
+        "wins": state['wins'],
+        "losses": state['losses'],
+        "max_drawdown": state['max_drawdown']
+    }
+    return log_rows, summary
 
-            
-    # Calculate final profit or loss and WinRate
-    final_bank = bank + (holdings * data.iloc[-1]['close'])
-    profit_loss = final_bank - initial_bank
-    winrate = wins / (wins + losses) if (wins + losses) > 0 else 0
-    roi = (final_bank - initial_bank) / initial_bank
-    
-    return profit_loss, winrate, wins, losses, max_drawdown, roi, initial_bank, first_tp_perc, sec_tp_perc, sl_perc, rsi_value_1, rsi_value_2, buy_rsi_1, buy_rsi_2, buy_rsi_3
+def main():
+    cfg = load_config()
+    if not os.path.exists(LOGS_DIR):
+        os.makedirs(LOGS_DIR)
+    print(f"Loading data for {cfg['pair']} {cfg['timeframe']} from {cfg['starting_date']} to {cfg['ending_date']}")
+    data = download_data(cfg["pair"], cfg["timeframe"], cfg["starting_date"], cfg["ending_date"])
+    data['RSI'] = calculate_rsi(data['close'], periods=cfg["rsi_periods"], ema=cfg["rsi_ema"])
+    print("Running backtest...")
+    logs, stats = backtest_strategy(data, cfg)
+    pd.DataFrame(logs).to_csv(CSV_PATH, index=False)
+    print(f"Backtest log written to {CSV_PATH}")
+    print("=== Backtest Summary ===")
+    print(f"Profit/Loss: {stats['profit_loss']:.2f}")
+    print(f"ROI: {stats['roi']*100:.2f}%")
+    print(f"WinRate: {stats['winrate']*100:.2f}%")
+    print(f"Wins: {stats['wins']} | Losses: {stats['losses']}")
+    print(f"Max Drawdown: {stats['max_drawdown']:.2f}%")
 
-def save_results(pair, timeframe, starting_date, end_date, initial_bank, profit_loss, roi, winrate, wins, losses, max_drawdown,  first_tp_perc, sec_tp_perc, sl_perc, rsi_value_1, rsi_value_2, buy_rsi_1, buy_rsi_2, buy_rsi_3):
-    if roi > 0.50 and winrate > 0.70:
-        with open('best_assets.txt', 'a') as file:
-            file.write(f"Pair: {pair}\n")
-            file.write(f'Timeframe: {timeframe}\n')
-            file.write(f'Starting date: {starting_date}\n')
-            file.write(f'End date: {end_date}\n')
-            file.write(f'Initial Bank: {initial_bank}\n')
-            file.write(f"Final Profit/Loss: {profit_loss}\n")
-            file.write(f"ROI: {roi*100}%\n")
-            file.write(f"Win Rate: {winrate*100}%\n")
-            file.write(f"Wins: {wins}, Losses: {losses}\n")
-            file.write(f"Max Drawdown: {max_drawdown}%\n")
-            file.write(f'RSI values for the buys:\n')
-            file.write(f'First buy at RSI value: {buy_rsi_1}\n')
-            file.write(f'Second buy at RSI value: {buy_rsi_2}\n')
-            file.write(f'Third buy at RSI value: {buy_rsi_3}\n')
-            file.write(f'Values in TPs:\n')
-            file.write(f'First TP percentage: {first_tp_perc}%\n')
-            file.write(f'Second TP percentage: {sec_tp_perc}%\n')
-            file.write(f'First RSI TP value: {rsi_value_1}\n')
-            file.write(f'Second RSI TP value: {rsi_value_2}\n')
-            file.write(f'Value in SL:\n')
-            file.write(f'SL percentage: {sl_perc}%\n')
-            file.write(f"---------------------------------\n\n")
-
-
-# Load historical data for the cryptocurrency
-timeframe = "5m"
-starting_date = "1 January 2022"
-end_date = "15 November 2023"
-data = download_data("QNT", "USDT", timeframe, starting_date, end_date)
-data['RSI'] = calculate_rsi(data['close'])
-
-# Run backtest
-result, winrate, wins, losses, max_drawdown, roi, initial_bank, first_tp_perc, sec_tp_perc, sl_perc, rsi_value_1, rsi_value_2, buy_rsi_1, buy_rsi_2, buy_rsi_3 = backtest_strategy(data)
-print(f"Pair: {pair}")
-print(f"Final Profit/Loss: {result}")
-print(f"TimeFrame: {timeframe}")
-print(f"Starting date: {starting_date}")
-print(f"End date: {end_date}")
-print(f"ROI: {roi*100}%")
-print(f"WinRate: {winrate*100}%")
-print(f"Wins: {wins}, Losses: {losses}")
-print(f"Max Drawdown: {max_drawdown}%")
-save_results(pair, timeframe, starting_date, end_date, initial_bank, result, roi, winrate, wins, losses, max_drawdown, first_tp_perc, sec_tp_perc, sl_perc, rsi_value_1, rsi_value_2, buy_rsi_1, buy_rsi_2, buy_rsi_3)
-
+if __name__ == '__main__':
+    main()

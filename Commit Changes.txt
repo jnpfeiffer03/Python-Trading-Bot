@@ -1,0 +1,32 @@
+Commit Roadmap
+
+Moved/renamed file, update import paths.
+Replaced hardcoded TP/SL/RSI values with reads from config.json.
+Added .env loading for API keys (with dotenv).
+Added loss recovery / martingale toggle logic
+Added martingale boolean option in config and use it in buy logic to include loss or not.
+Added last_realized_loss to state, carry over loss after failed trades.
+Added fee_rate in config.
+Created /logs/live_trades.csv and write every trade (buy, TP1, TP2, stoploss) with full details.
+Added persistent state saving / crash recovery
+Saved state dict to JSON (e.g. /logs/live_state.json) after each trade.
+Added optimizer / parameter search script
+New optimize_params.py that grid-searches over RSI, SL, TP, martingale, RSI periods, etc.
+Updated requirements.txt
+
+Summary:
+feat: add martingale (loss recovery) support with toggle
+feat: simulate trading fees using fee_rate config
+feat: live trade logging to logs/live_trades.csv
+feat: persistent state saving & resume from logs/live_state.json
+refactor: backtesting updated to match live logic (fees, martingale)
+feat: add optimization script optimize_params.py
+chore: update config.json schema, add fee_rate & martingale
+chore: update requirements.txt (add python-dotenv, pandas)
+docs: rewrite README to reflect new architecture
+chore: add .env.example and update .gitignore
+test: add unit test for RSI calculation
+refactor: modularize common code (RSI, fetch, logging)
+
+
+
